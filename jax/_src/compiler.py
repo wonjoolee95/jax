@@ -21,7 +21,7 @@ import logging
 import os
 import tempfile
 import time
-from typing import Any
+from typing import Any, Optional
 import warnings
 
 from jax._src import compilation_cache
@@ -280,6 +280,22 @@ def compile_or_get_cached(
     return backend_compile(backend, computation, compile_options,
                            host_callbacks)
 
+  if (
+      process_count() > 1
+      and config.share_fdo_profile.value
+      and distributed.global_state.client is not None
+  ):
+    compile_options.executable_build_options.fdo_profile = _share_fdo_profiles(
+        computation,
+        devices,
+        compile_options,
+        backend,
+        distributed.global_state.client,
+    )
+    cache_key = compilation_cache.get_cache_key(
+        computation, devices, compile_options, backend
+    )
+
   cache_retrieval_start = time.monotonic()
   retrieved_executable, retrieved_compile_time = _cache_read(
       module_name, cache_key, compile_options, backend)
@@ -298,7 +314,8 @@ def compile_or_get_cached(
         "/jax/compilation_cache/cache_retrieval_time_sec", cache_retrieval_time)
 
     return retrieved_executable
-  elif (
+
+  if (
       process_count() > 1
       and config.share_binary_between_hosts.value
       and distributed.global_state.client is not None
@@ -339,6 +356,43 @@ def compile_or_get_cached(
         cache_key,
     )
 
+
+# The process with id 0 should share FDO profile before compilation with other
+# processes.
+def _share_fdo_profiles(
+    computation: ir.Module,
+    devices: np.ndarray,
+    compile_options: xc.CompileOptions,
+    backend: xc.Client,
+    global_client: lib.xla_extension.DistributedRuntimeClient,
+) -> Optional[bytes]:
+  fdo_profile = compile_options.executable_build_options.fdo_profile
+  if fdo_profile is None or len(fdo_profile) == 0:
+    return fdo_profile
+
+  compile_options.executable_build_options.fdo_profile = b""
+  profile_key = (
+      compilation_cache.get_cache_key(
+          computation, devices, compile_options, backend
+      )
+      + "_fdo_sync"
+  )
+  if profile_key in _share_fdo_profiles.modules_profiles:
+    return _share_fdo_profiles.modules_profiles[profile_key]
+
+  share_timeout = config.share_binary_between_hosts_timeout_ms.value
+  if distributed.global_state.process_id == 0:
+    global_client.key_value_set_bytes(profile_key, fdo_profile)
+  else:
+    fdo_profile = global_client.blocking_key_value_get_bytes(
+        profile_key, share_timeout
+    )
+
+  _share_fdo_profiles.modules_profiles[profile_key] = fdo_profile
+  return fdo_profile
+
+
+_share_fdo_profiles.modules_profiles = {}
 
 # The process with id 0 should compile the module and write an autotune config
 # to the K-V storage.

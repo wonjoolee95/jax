@@ -1181,18 +1181,23 @@ class ExecuteReplicated:
     if self.mut:
       args = [*args, *self.mut.in_mut]
     input_bufs = self.in_handler(args)
+    profile_runner = self.xla_executable.profile_runner
     if (self.ordered_effects or self.has_unordered_effects
         or self.has_host_callbacks):
       input_bufs = self._add_tokens_to_inputs(input_bufs)
-      results = self.xla_executable.execute_sharded(
-          input_bufs, with_tokens=True
-      )
+
+      with profiler.ProfileSessionRunnerWrapper(profile_runner):
+        results = self.xla_executable.execute_sharded(
+            input_bufs, with_tokens=True
+        )
+
       result_token_bufs = results.disassemble_prefix_into_single_device_arrays(
           len(self.ordered_effects))
       sharded_runtime_token = results.consume_token()
       self._handle_token_bufs(result_token_bufs, sharded_runtime_token)
     else:
-      results = self.xla_executable.execute_sharded(input_bufs)
+      with profiler.ProfileSessionRunnerWrapper(profile_runner):
+        results = self.xla_executable.execute_sharded(input_bufs)
     if dispatch.needs_check_special():
       out_arrays = results.disassemble_into_single_device_arrays()
       for arrays in out_arrays:

@@ -224,7 +224,7 @@ def _get_states(attrs_tracked):
 
 def _get_fastpath_data(
     executable, out_tree, args_flat, out_flat, attrs_tracked, effects,
-    consts, abstracted_axes,
+    consts, abstracted_axes, profile_runner
 ) -> Optional[pxla.MeshExecutableFastpathData]:
   out_reflattened, out_tree = pxla.reflatten_outputs_for_dispatch(out_tree, out_flat)
 
@@ -246,6 +246,8 @@ def _get_fastpath_data(
       and not (config.debug_key_reuse.value and any(
         hasattr(arg, 'dtype') and dtypes.issubdtype(arg.dtype, dtypes.prng_key)
         for arg in (*args_flat, *out_flat, *consts)))
+      and profile_runner is not None
+      and profile_runner.is_fdo_consumed()
       )
 
   if use_fastpath:
@@ -268,6 +270,8 @@ def _get_fastpath_data(
     fastpath_data = None
   return fastpath_data
 
+
+_jaxpr_to_profile_session_runner = {}
 
 class _MostRecentPjitCallExecutable(threading.local):
   def __init__(self):
@@ -307,9 +311,9 @@ def _cpp_pjit(jit_info: PjitInfo):
     executable = _read_most_recent_pjit_call_executable(jaxpr)
     maybe_fastpath_data = _get_fastpath_data(
         executable, out_tree, args_flat, out_flat, attrs_tracked, jaxpr.effects,
-        jaxpr.consts, jit_info.abstracted_axes)
+        jaxpr.consts, jit_info.abstracted_axes,
+        _jaxpr_to_profile_session_runner.get(jaxpr, None))
     return outs, maybe_fastpath_data
-
   fun = jit_info.fun
   if xla_extension_version >= 226:
     cpp_pjit_f = xc._xla.pjit(  # type: ignore
@@ -1448,12 +1452,36 @@ def _pjit_call_impl_python(
     *args, jaxpr, in_shardings, out_shardings, in_layouts, out_layouts,
     resource_env, donated_invars, name, keep_unused, inline):
   global _most_recent_pjit_call_executable
+  global _jaxpr_to_profile_session_runner
+
+  if jaxpr not in _jaxpr_to_profile_session_runner:
+    _jaxpr_to_profile_session_runner[jaxpr] = xc._xla.create_profile_runner(
+        config.pgle_data_collecting_retries.value
+    )
+
+  fdo_profile = _jaxpr_to_profile_session_runner[jaxpr].consume_fdo_profile()
+  compile_options = None
+  if fdo_profile:
+    compile_options = {}
+    compile_options['fdo_profile'] = fdo_profile
 
   compiled = _resolve_and_lower(
-      args, jaxpr=jaxpr, in_shardings=in_shardings, out_shardings=out_shardings,
-      in_layouts=in_layouts, out_layouts=out_layouts, resource_env=resource_env,
-      donated_invars=donated_invars, name=name, keep_unused=keep_unused,
-      inline=inline, lowering_parameters=mlir.LoweringParameters()).compile()
+      args,
+      jaxpr=jaxpr,
+      in_shardings=in_shardings,
+      out_shardings=out_shardings,
+      in_layouts=in_layouts,
+      out_layouts=out_layouts,
+      resource_env=resource_env,
+      donated_invars=donated_invars,
+      name=name,
+      keep_unused=keep_unused,
+      inline=inline,
+      lowering_parameters=mlir.LoweringParameters(),
+  ).compile(compile_options)
+
+  if not fdo_profile:
+    compiled.profile_runner = _jaxpr_to_profile_session_runner[jaxpr]
 
   _most_recent_pjit_call_executable.weak_key_dict[jaxpr] = compiled
   # This check is expensive so only do it if enable_checks is on.
@@ -1531,7 +1559,8 @@ def _pjit_call_impl(*args, jaxpr,
         inline=inline)
     fastpath_data = _get_fastpath_data(
         compiled, tree_structure(out_flat), args, out_flat, [], jaxpr.effects,
-        jaxpr.consts, None)
+        jaxpr.consts, None,
+        _jaxpr_to_profile_session_runner.get(jaxpr, None))
     return out_flat, fastpath_data
 
   f = _get_jaxpr_as_fun(

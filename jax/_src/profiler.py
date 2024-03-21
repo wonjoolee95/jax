@@ -380,3 +380,17 @@ def save_device_memory_profile(filename, backend: str | None = None) -> None:
   profile = device_memory_profile(backend)
   with open(filename, "wb") as f:
     f.write(profile)
+
+
+class ProfileSessionRunnerWrapper:
+
+  def __init__(self, session_runner):
+    self.profile_session_runner = session_runner
+
+  def __enter__(self):
+    if self.profile_session_runner:
+      self.profile_session_runner.start()
+
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    if self.profile_session_runner:
+      self.profile_session_runner.stop()
