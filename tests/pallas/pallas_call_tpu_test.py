@@ -1730,6 +1730,143 @@ class PallasCallWhileLoopTest(PallasTPUTest):
     expected = jnp.sum(jnp.arange(1024))
     np.testing.assert_array_equal(r, expected)
 
+  def test_non_range_while_loop(self):
+    """Tests lowering of a while_loop which cannot reduce to a fori_loop."""
+
+    def kernel(x_ref, r_ref):
+      @pl.when(pl.program_id(0) == 0)
+      def _():
+        pl.store(r_ref, (0, 0), 0)
+
+      def cond(state):
+        i, s = state
+        return jnp.logical_and(i < 1024, s < 1024)
+
+      def body(state):
+        i, s = state
+        sl = sl = jax.lax.div(i, 128)
+        l = jax.lax.rem(i, 128)
+        v = pl.load(x_ref, (0, sl, l))
+        return i + 1, s + v
+
+      i = jnp.int32(0)
+      s = pl.load(r_ref, (0, 0))
+
+      i, s = jax.lax.while_loop(cond, body, (i, s))
+      pl.store(r_ref, (0, 0), s)
+
+    x = jnp.arange(4096)
+    x = jnp.reshape(x, [4, 8, 128])
+
+    r = pl.pallas_call(
+        kernel,
+        grid=(4,),
+        out_specs=pl.BlockSpec(block_shape=(1, 1), memory_space=pltpu.SMEM),
+        out_shape=jax.ShapeDtypeStruct([1, 1], jnp.int32),
+        in_specs=[
+            pl.BlockSpec(
+                lambda i: (i, 0, 0),
+                block_shape=(1, 8, 128),
+                memory_space=pltpu.SMEM,
+            )
+        ],
+    )(x)
+    np.testing.assert_array_equal(r, [[1035]])
+
+  def test_vector_carry_while_loop(self):
+    """Tests lowering of a while_loop which carries a vector quantity."""
+
+    def kernel(x_ref, r_ref):
+
+      def cond(v):
+        return v[0, 0] < 16
+
+      def body(v):
+        return v * 2
+
+      r_ref[:] = jax.lax.while_loop(cond, body, x_ref[:])
+
+    x = jnp.full((8, 128), 3, dtype=jnp.int32)
+    fn = pl.pallas_call(
+        kernel,
+        grid=(1,),
+        in_specs=[pl.BlockSpec(lambda i: (0, 0), (8, 128))],
+        out_specs=pl.BlockSpec(lambda i: (0, 0), (8, 128)),
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.int32),
+    )
+    r = fn(x)
+    reduced = jnp.sum(r)
+    # 3 -> 6 -> 12 -> 24
+    np.testing.assert_array_equal(reduced, 1024 * 24)
+
+  def test_nested_while_loop(self):
+    """Tests lowering a nested while_loop."""
+
+    def kernel(in_key_ref, out_segment_count, out_size_ref, key_count):
+      # Compute the length of contiguous segments of keys.
+
+      def inner_cond(carry):
+        i, prev_key = carry
+        key = jax.lax.cond(
+            i < key_count, lambda i: in_key_ref[0, i], lambda i: -1, i
+        )
+        return jnp.logical_and(i < key_count, key == prev_key)
+
+      def inner_body(carry):
+        i, key = carry
+        return i + 1, key
+
+      def outer_cond(carry):
+        i, _ = carry
+        return i < key_count
+
+      def outer_body(carry):
+        i, next_out_idx = carry
+        key = in_key_ref[0, i]
+        end, _ = jax.lax.while_loop(inner_cond, inner_body, (i + 1, key))
+        out_size_ref[0, next_out_idx] = end - i
+        return end, next_out_idx + 1
+
+      _, count = jax.lax.while_loop(outer_cond, outer_body, (0, 0))
+      out_segment_count[0, 0] = count
+
+    keys = [4, 4, 4, 3, 2, 2, 7, 7, 7, 7]
+    keys = jnp.asarray(keys)
+    keys = jnp.pad(keys, (0, 118), constant_values=32768)
+    key_count = keys.shape[0]
+    keys = jnp.reshape(keys, (1, 128))
+    kernel_fn = partial(kernel, key_count=key_count)
+
+    fn = pl.pallas_call(
+        kernel_fn,
+        grid=(1,),
+        in_specs=[
+            # keys.
+            pl.BlockSpec(
+                lambda i: (0, 0),
+                block_shape=(1, key_count),
+                memory_space=pltpu.SMEM,
+            ),
+        ],
+        out_specs=[
+            # Segments found.
+            pl.BlockSpec(block_shape=(1, 1), memory_space=pltpu.SMEM),
+            # Segment sizes.
+            pl.BlockSpec(block_shape=(1, key_count), memory_space=pltpu.SMEM),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((1, 1), jnp.int32),
+            jax.ShapeDtypeStruct((1, key_count), jnp.int32),
+        ],
+    )
+    count, sizes = fn(keys)
+    np.testing.assert_equal(count[0, 0], jnp.asarray(5))
+    np.testing.assert_equal(sizes[0, 0], jnp.asarray(3))
+    np.testing.assert_equal(sizes[0, 1], jnp.asarray(1))
+    np.testing.assert_equal(sizes[0, 2], jnp.asarray(2))
+    np.testing.assert_equal(sizes[0, 3], jnp.asarray(4))
+    np.testing.assert_equal(sizes[0, 4], jnp.asarray(118))
+
 
 class PallasCallPipelineTest(parameterized.TestCase):
 
