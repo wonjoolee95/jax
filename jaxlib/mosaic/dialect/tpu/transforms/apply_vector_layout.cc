@@ -193,7 +193,7 @@ xla::Array<Value> concatenate(const ArrayRef<xla::Array<Value>> arrays,
   }
   xla::Array<Value> res(dims);
   int64_t offset = 0;
-  for (xla::Array<Value> const& arr : arrays) {
+  for (xla::Array<Value> const &arr : arrays) {
     arr.Each([&](const absl::Span<const int64_t> idx, const Value v) {
       SmallVector<int64_t> res_idx(toArrayRef(idx));
       res_idx[axis] += offset;
@@ -249,7 +249,7 @@ bool incrementIndex(const MutableArrayRef<int64_t> idx,
 }
 
 bool sliceIsEmpty(const absl::Span<const int64_t> starts,
-                 const absl::Span<const int64_t> limits) {
+                  const absl::Span<const int64_t> limits) {
   for (auto [s, l] : llvm::zip_equal(starts, limits)) {
     CHECK_LE(s, l);
     if (s == l) {
@@ -1135,7 +1135,7 @@ LogicalResult tpu_load_rule(RewriteContext &ctx, Operation &op,
   }
   tpu::LoadOp load_op = cast<tpu::LoadOp>(op);
   if (layout_out != VectorLayout(32, {0, 0}, ctx.target_shape,
-                                   VectorLayout::ImplicitDim::kNone)) {
+                                 VectorLayout::ImplicitDim::kNone)) {
     return op.emitOpError("Invalid output layout for ") << load_op->getName();
   }
   FAILUREOR_ASSIGN_OR_RETURN(
@@ -1691,7 +1691,7 @@ LogicalResult tpu_assume_layout_rule(RewriteContext &ctx, Operation &op,
   TPU_ASSERT_EQ_OP(op.getNumResults(), 1);
   TPU_ASSERT_EQ_OP(layouts_in.size(), 1);
   TPU_ASSERT_EQ_OP(layouts_out.size(), 1);
-  if (layouts_in[0] !=layouts_out[0]) {
+  if (layouts_in[0] != layouts_out[0]) {
     return op.emitOpError("Expected same input and output layout");
   }
   OpBuilder builder(&op);
@@ -2453,8 +2453,7 @@ LogicalResult vector_broadcast_rule(RewriteContext &ctx, Operation &op,
     const LayoutOffsets offsets_in = layout_in.offsets();
     const LayoutOffsets offsets_out = layout_out.offsets();
     if (layout_in.tiling() != layout_out.tiling()) {
-      return op.emitOpError(
-          "Not implemented: Changing tiling mid-broadcast");
+      return op.emitOpError("Not implemented: Changing tiling mid-broadcast");
     }
     auto tiling = layout_in.tiling();
 
@@ -2576,8 +2575,7 @@ LogicalResult vector_broadcast_rule(RewriteContext &ctx, Operation &op,
             VectorType::get(ctx.target_shape, builder.getI32Type());
         auto idx_const = builder.create<arith::ConstantOp>(
             broadcast_op.getLoc(), idx_ty,
-            DenseElementsAttr::get(idx_ty,
-                                   builder.getI32IntegerAttr(offset)));
+            DenseElementsAttr::get(idx_ty, builder.getI32IntegerAttr(offset)));
         int64_t sublanes_per_tile = layout_in.sublanesPerTile(ctx.target_shape);
         DenseI32ArrayAttr sublane_pattern;
         if (num_tiles != 1) {
@@ -3518,11 +3516,6 @@ LogicalResult vector_transpose_rule(RewriteContext &ctx, Operation &op,
         "Not implemented: Non-native or offset layout unsupported");
   }
   const int64_t transpose_unit_size = ctx.target_shape[1];
-  for (const int64_t s : src_ty.getShape().take_back(2)) {
-    if (s % transpose_unit_size != 0) {
-      return transpose_op->emitOpError("Not implemented: Padded transpose");
-    }
-  }
   if (ctx.hardware_generation < 4 && layout_in.bitwidth() != 32) {
     return transpose_op->emitOpError(
         "Not implemented: TPUs before v4 only support 32-bit transposes");
@@ -3561,8 +3554,8 @@ LogicalResult vector_transpose_rule(RewriteContext &ctx, Operation &op,
     src_slice_ends.append(incremented_batch_idx.begin(),
                           incremented_batch_idx.end());
     src_slice_ends.append({(src_row + 1) * vregs_per_tile, src_col_end});
-    xla::Array<Value> src_tile_vregs =
-        src_vregs.Slice(src_slice_starts, src_slice_ends);
+    xla::Array<Value> src_tile_vregs = src_vregs.Slice(
+        src_slice_starts, src_slice_ends, /*out_of_bounds_ok=*/true);
     // Drop leading singleton (batch) dimensions to have a shape that conforms
     // with the vreg array shape specified by layout_in, as expected by assemble
     src_tile_vregs.Reshape(
@@ -3595,10 +3588,10 @@ LogicalResult vector_transpose_rule(RewriteContext &ctx, Operation &op,
   SmallVector<int64_t> batch_idx(num_batch_dims);
   do {
     const int64_t tile_rows =
-        *(src_ty.getShape().end() - 2) / transpose_unit_size;
+        xla::CeilOfRatio(*(src_ty.getShape().end() - 2), transpose_unit_size);
     for (int64_t src_row = 0; src_row < tile_rows; ++src_row) {
       const int64_t num_col_tiles =
-          *(src_ty.getShape().end() - 1) / transpose_unit_size;
+          xla::CeilOfRatio(*(src_ty.getShape().end() - 1), transpose_unit_size);
       if (can_batch) {
         const int64_t num_batch_tiles = num_col_tiles / 2;
         for (int64_t src_col = 0; src_col < num_batch_tiles; ++src_col) {
@@ -4128,7 +4121,7 @@ FailureOr<TypedValue<VectorType>> relayout(
                                  *(src_tiles.dimensions().end() - 2) == 1)) &&
       dst.offsets()[1] == 0 && src.tiling() == std::array<int64_t, 2>{1, 128} &&
       dst.tiling() == std::array<int64_t, 2>{8, 128}) {
-   xla::Array<Value> src_tiles_retiled(
+    xla::Array<Value> src_tiles_retiled(
         dst.tileArrayShape(vty.getShape(), target_shape));
     src_tiles_retiled.Each([&](absl::Span<const int64_t> idx, Value *tile) {
       for (int dst_sl_idx = 0; dst_sl_idx < 8; ++dst_sl_idx) {
@@ -4317,8 +4310,8 @@ FailureOr<TypedValue<VectorType>> relayout(
             v.getLoc(), bits_vreg_ty,
             DenseElementsAttr::get(bits_vreg_ty, shift_bits));
         dst_tiles.Each([&](absl::Span<const int64_t> /*idx*/, Value *tile) {
-          auto bit_tile =
-              builder.create<tpu::BitcastVregOp>(v.getLoc(), bits_vreg_ty, *tile);
+          auto bit_tile = builder.create<tpu::BitcastVregOp>(
+              v.getLoc(), bits_vreg_ty, *tile);
           Operation *shift_tile;
           if (subelem_diff > 0) {
             shift_tile =
@@ -4330,7 +4323,7 @@ FailureOr<TypedValue<VectorType>> relayout(
           }
           *tile = builder
                       .create<tpu::BitcastVregOp>(v.getLoc(), tile->getType(),
-                                              shift_tile->getResult(0))
+                                                  shift_tile->getResult(0))
                       .getResult();
           return absl::OkStatus();
         });
