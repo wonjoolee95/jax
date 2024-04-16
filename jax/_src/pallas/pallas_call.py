@@ -65,6 +65,7 @@ def _maybe_dynamic_slice(start_idx, block_shape, value, is_indexing):
     return value
   assert is_indexing is not None
   start_idx = tuple(jnp.asarray(s, dtype=jnp.int32) for s in start_idx)
+  value = _maybe_pad_tensor(value, block_shape)
   output = lax.dynamic_slice(value, start_idx, slice_sizes=block_shape)
   squeeze_dims = tuple(np.arange(len(is_indexing))[np.array(is_indexing,
                                                             dtype=np.bool_)])
@@ -81,7 +82,11 @@ def _maybe_dynamic_update_slice(start_idx, block_shape, value, update,
                          if not b)
   update = lax.broadcast_in_dim(update, block_shape, broadcast_dims)
   assert update.shape == block_shape
-  return lax.dynamic_update_slice(value, update, start_idx)
+  padded_value = _maybe_pad_tensor(value, block_shape)
+  padded_value = lax.dynamic_update_slice(padded_value, update, start_idx)
+  return lax.dynamic_slice(
+      padded_value, jnp.zeros_like(jnp.asarray(value.shape)), value.shape
+  )
 
 def _uninitialized_value(shape, dtype):
   if jnp.issubdtype(dtype, jnp.floating):
@@ -89,6 +94,20 @@ def _uninitialized_value(shape, dtype):
   elif jnp.issubdtype(dtype, jnp.integer):
     return jnp.full(shape, jnp.iinfo(dtype).min, dtype)
   raise NotImplementedError(dtype)
+
+
+def _maybe_pad_tensor(value, block_shape):
+  """Pad a tensor with if it does not align with block_shape."""
+  padded_shape = tuple(
+      ((v - 1) // b + 1) * b for v, b in zip(value.shape, block_shape)
+  )
+  if padded_shape != value.shape:
+    new_value = _uninitialized_value(padded_shape, value.dtype)
+    value = lax.dynamic_update_slice(
+        new_value, value, jnp.zeros_like(jnp.asarray(value.shape))
+    )
+  return value
+
 
 def _get_next_indices(grid, indices):
   next_indices = []
